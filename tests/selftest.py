@@ -1,181 +1,252 @@
-"""端到端自测：写偏斜（撤班样例）、锁等待、超时回滚与重跑、blocked 未阻塞分支。
+"""端到端自测：逻辑订阅重号冲突恢复演练台。
 
-用法：
-  docker compose up -d --build 之后：
-      docker compose exec web python tests/selftest.py
-  或对着任意可达的 PostgreSQL：
-      PGHOST=... PGPORT=... PGDATABASE=... PGUSER=... PGPASSWORD=... python tests/selftest.py
+覆盖场景：
+  T1 冲突形成：订阅卡在 23505 重号，两张上游回执都进不了下游，页面数据可见；
+  T2 更正补录行：校验非法输入、更正成功后旧核实记录作废；
+  T3 过期确认：核实后超过 TTL 再确认 -> 拒绝，订阅表/留存表内容不变；
+  T4 核实后更正：核实 -> 更正 -> 确认 -> 哈希不符拒绝，两表内容不变；
+  T5 正常确认：核实 -> 确认 -> 单事务转存留存 + 删除原行，进入等待回放；
+  T6 回放恢复：轮询到两张上游回执都以 upstream 到达，阶段才变为 recovered；
+  T7 重置：可反复演练，新一轮重新形成冲突；
+  T8 页面可打开、伪造核实记录的确认被拒绝。
+
+用法（compose 栈起来之后）：
+  docker compose exec web python tests/selftest.py
+或对任意可达的演练台：
+  BASE_URL=http://127.0.0.1:8091 python tests/selftest.py
 """
+import json
 import os
 import sys
+import time
+import urllib.error
+import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
-
-from engine import run_experiment  # noqa: E402
-from presets import PRESETS  # noqa: E402
-from script_parser import ScriptError, parse_script  # noqa: E402
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+# 与服务端 VERIFY_TTL_SECONDS 对齐（本地自测可设短一点，如 4）
+TTL = int(os.environ.get("VERIFY_TTL_SECONDS", "60"))
+POLL_TIMEOUT_S = 45
 
 FAILURES = []
 
 
-def conninfo():
-    return {
-        "host": os.environ.get("PGHOST", "localhost"),
-        "port": int(os.environ.get("PGPORT", "5432")),
-        "dbname": os.environ.get("PGDATABASE", "postgres"),
-        "user": os.environ.get("PGUSER", "postgres"),
-        "password": os.environ.get("PGPASSWORD", ""),
-        "connect_timeout": 10,
-    }
-
-
-def preset(pid):
-    return next(p for p in PRESETS if p["id"] == pid)
-
-
-def run_preset(pid, timeout=6.0):
-    p = preset(pid)
-    steps = parse_script(p["script"])
-    return run_experiment(conninfo(), p["init_sql"], steps, p["check_sql"], timeout)
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        BASE_URL + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode()
+            ctype = resp.headers.get("Content-Type", "")
+            payload = json.loads(raw) if "application/json" in ctype else raw
+            return resp.status, payload
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode()
+        try:
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, raw
 
 
 def check(name, cond, detail=""):
-    status = "PASS" if cond else "FAIL"
-    print(f"  [{status}] {name}" + (f"  ({detail})" if detail and not cond else ""))
+    mark = "PASS" if cond else "FAIL"
+    print(f"[{mark}] {name}" + (f" -- {detail}" if detail else ""))
     if not cond:
         FAILURES.append(name)
 
 
-def check_value(rows, col_name, columns):
-    idx = columns.index(col_name)
-    return rows[0][idx]
+def wait_state(pred, desc):
+    deadline = time.time() + POLL_TIMEOUT_S
+    last = None
+    while time.time() < deadline:
+        _, state = call("GET", "/api/state")
+        last = state
+        if pred(state):
+            return state
+        time.sleep(1)
+    raise AssertionError(f"等待超时：{desc}；最后状态={json.dumps(last, ensure_ascii=False)[:400]}")
 
 
-def test_parser():
-    print("== 脚本解析器 ==")
-    steps = parse_script(preset("lock-wait")["script"])
-    check("解析行锁等待样例得到 4 步", len(steps) == 4, f"got {len(steps)}")
-    check("第 2 步是 B/blocked", steps[1].session == "B" and steps[1].mode == "blocked")
-    check("其余步骤是 complete 模式", all(s.mode == "complete" for s in steps if s.index != 1))
-    try:
-        parse_script("SELECT 1;")
-        check("头部之外的 SQL 报错", False)
-    except ScriptError:
-        check("头部之外的 SQL 报错", True)
-    try:
-        parse_script("@A complete\n")
-        check("空步骤报错", False)
-    except ScriptError:
-        check("空步骤报错", True)
-    try:
-        parse_script("@A turbo\nSELECT 1;")
-        check("未知模式报错", False)
-    except ScriptError:
-        check("未知模式报错", True)
+def receipt_rows(state):
+    return {r["id"]: r for r in state["receipts"]}
 
 
-def test_write_skew():
-    print("== 两人同时撤班（写偏斜） ==")
-    rc, ser = run_preset("shift-withdraw")
-    check("RC 轮正常完成", not rc["timed_out"] and not rc["error"], rc.get("error"))
-    check("RC 两事务都提交",
-          rc["outcomes"]["A"]["outcome"] == "committed"
-          and rc["outcomes"]["B"]["outcome"] == "committed",
-          str(rc["outcomes"]))
-    rc_count = check_value(rc["check"]["rows"], "on_duty_count", rc["check"]["columns"])
-    check("RC 撤班后无人值守（on_duty_count = 0）", rc_count == 0, f"got {rc_count}")
-
-    check("SER 轮正常完成", not ser["timed_out"] and not ser["error"], ser.get("error"))
-    outcomes = sorted(o["outcome"] for o in ser["outcomes"].values())
-    check("SER 恰一个提交、一个中止", outcomes == ["aborted", "committed"], str(ser["outcomes"]))
-    has_40001 = any(e["kind"] == "step_error" and e.get("pgcode") == "40001"
-                    for e in ser["events"])
-    check("SER 时间线出现 40001 序列化失败", has_40001)
-    ser_count = check_value(ser["check"]["rows"], "on_duty_count", ser["check"]["columns"])
-    check("SER 仍有一人在岗（on_duty_count = 1）", ser_count == 1, f"got {ser_count}")
+def archive_ids(state):
+    return {r["id"] for r in state["archive"]}
 
 
-def test_lock_wait():
-    print("== 行锁等待（blocked 模式） ==")
-    rc, ser = run_preset("lock-wait")
-    check("RC 轮正常完成", not rc["timed_out"] and not rc["error"], rc.get("error"))
-    blocked_ev = [e for e in rc["events"] if e["kind"] == "blocked" and e["session"] == "B"]
-    check("B 被数据库确认阻塞", len(blocked_ev) == 1)
-    check("阻塞者正是会话 A", bool(blocked_ev and blocked_ev[0]["by_other"]))
-    resumed = [e for e in rc["events"]
-               if e["kind"] == "step_ok" and e["session"] == "B" and e.get("after_blocked")]
-    check("A 提交后 B 的 UPDATE 解除阻塞并完成", bool(resumed))
-    check("RC 两事务都提交",
-          rc["outcomes"]["A"]["outcome"] == "committed"
-          and rc["outcomes"]["B"]["outcome"] == "committed",
-          str(rc["outcomes"]))
-    rc_bal = check_value(rc["check"]["rows"], "balance", rc["check"]["columns"])
-    check("RC 余额 = 700（B 在 A 的结果上继续）", rc_bal == 700, f"got {rc_bal}")
-
-    check("SER 轮正常完成", not ser["timed_out"] and not ser["error"], ser.get("error"))
-    check("SER 下 A 提交、B 中止",
-          ser["outcomes"]["A"]["outcome"] == "committed"
-          and ser["outcomes"]["B"]["outcome"] == "aborted",
-          str(ser["outcomes"]))
-    ser_bal = check_value(ser["check"]["rows"], "balance", ser["check"]["columns"])
-    check("SER 余额 = 900（只有 A 生效）", ser_bal == 900, f"got {ser_bal}")
-
-
-def test_timeout_and_rerun():
-    print("== 超时回滚与重跑 ==")
-    rc, ser = run_preset("timeout-demo", timeout=3.0)
-    for rnd, name in ((rc, "RC"), (ser, "SER")):
-        check(f"{name} 轮判定为超时", rnd["timed_out"], str(rnd.get("error")))
-        check(f"{name} 两事务都被回滚",
-              rnd["outcomes"]["A"]["outcome"] == "rolled_back"
-              and rnd["outcomes"]["B"]["outcome"] == "rolled_back",
-              str(rnd["outcomes"]))
-        bal = check_value(rnd["check"]["rows"], "balance", rnd["check"]["columns"])
-        check(f"{name} 余额保持 1000（未提交的全部回滚）", bal == 1000, f"got {bal}")
-    cancelled = any(e["kind"] == "step_error" and e.get("pgcode") == "57014"
-                    for e in rc["events"])
-    check("RC 时间线出现语句被取消（57014）", cancelled)
-
-    # 超时之后立刻重跑另一组实验：仍应从初始数据开始并正常完成
-    rc2, _ = run_preset("lock-wait")
-    bal2 = check_value(rc2["check"]["rows"], "balance", rc2["check"]["columns"])
-    check("超时后重跑仍从初始数据开始（锁等待样例 RC 余额 = 700）",
-          not rc2["timed_out"] and bal2 == 700, f"got {bal2}")
-
-
-def test_no_block_branch():
-    print("== blocked 模式但语句未阻塞 ==")
-    init = preset("lock-wait")["init_sql"]
-    script = """@B blocked
-UPDATE accounts SET balance = 0 WHERE id = 999;
-
-@B complete
-COMMIT;"""
-    steps = parse_script(script)
-    rc, _ = run_experiment(conninfo(), init, steps,
-                           "SELECT balance FROM accounts WHERE id = 1;", 5.0)
-    check("语句直接完成、本轮未超时", not rc["timed_out"] and not rc["error"])
-    check("时间线记录“未阻塞”事件",
-          any(e["kind"] == "no_block" for e in rc["events"]))
-    bal = check_value(rc["check"]["rows"], "balance", rc["check"]["columns"])
-    check("未命中任何行，余额不变（1000）", bal == 1000, f"got {bal}")
+def fresh_round():
+    """重置并等待新一轮冲突形成（阶段切换 + 冲突事件落库）。"""
+    code, data = call("POST", "/api/reset")
+    check("重置接口返回 200", code == 200 and data.get("ok"), str(data))
+    state = wait_state(
+        lambda s: s["scenario"]["phase"] == "stuck"
+        and any(c["sqlstate"] == "23505" for c in s["conflicts"]),
+        "阶段进入 stuck 且探测到 23505 冲突",
+    )
+    return state
 
 
 def main():
-    test_parser()
-    test_write_skew()
-    test_lock_wait()
-    test_timeout_and_rerun()
-    test_no_block_branch()
+    # 页面可打开
+    code, _ = call("GET", "/")
+    check("T8 首页可打开", code == 200)
+
+    # ---------- T1 冲突形成 ----------
+    state = fresh_round()
+    rows = receipt_rows(state)
+    check("T1 阶段=stuck", state["scenario"]["phase"] == "stuck")
+    check("T1 期望回放回执为 1000/1001",
+          state["scenario"]["expected_ids"] == [1000, 1001])
+    check("T1 下游只有人工补录 1001",
+          set(rows) == {1001} and rows[1001]["source"] == "manual",
+          str([(r["id"], r["source"]) for r in state["receipts"]]))
+    check("T1 上游 1000 未进入下游", 1000 not in rows)
+    conflicts = state["conflicts"]
+    check("T1 探测到冲突事件", len(conflicts) >= 1)
+    check("T1 冲突含 23505 重号",
+          any(c["sqlstate"] == "23505" for c in conflicts))
+    check("T1 冲突关联回执 1001",
+          any(c["receipt_id"] == 1001 for c in conflicts))
+    check("T1 留存表为空", archive_ids(state) == set())
+    check("T1 订阅处于启用状态", state["subscription"]["subenabled"] is True)
+
+    # ---------- T2 更正补录行 ----------
+    code, data = call("POST", "/api/receipts/1001/correct",
+                      {"order_no": "SO-FIX-1001", "customer": "乙公司（更正）",
+                       "amount": "250.00", "note": "值班员更正补录"})
+    check("T2 合法更正成功", code == 200 and data.get("ok"), str(data))
+    _, state = call("GET", "/api/state")
+    rows = receipt_rows(state)
+    check("T2 更正后内容已更新",
+          rows[1001]["order_no"] == "SO-FIX-1001"
+          and rows[1001]["customer"] == "乙公司（更正）"
+          and str(rows[1001]["amount"]) == "250.00")
+    code, data = call("POST", "/api/receipts/1001/correct",
+                      {"order_no": "X", "customer": "Y",
+                       "amount": "-1", "note": "n"})
+    check("T2 非法金额被拒", code == 400 and not data.get("ok"), str(data))
+    code, data = call("POST", "/api/receipts/1001/correct",
+                      {"order_no": "X", "customer": "Y",
+                       "amount": "abc", "note": "n"})
+    check("T2 非数字金额被拒", code == 400 and not data.get("ok"), str(data))
+
+    # ---------- T3 过期确认 ----------
+    code, data = call("POST", "/api/receipts/1001/verify",
+                      {"operator": "自测-甲"})
+    check("T3 核实成功", code == 200 and data.get("ok"), str(data))
+    vid = data.get("verification_id")
+    _, before = call("GET", "/api/state")
+    print(f"    等待核实过期（TTL={TTL}s）…")
+    time.sleep(TTL + 2)
+    code, data = call("POST", "/api/receipts/1001/confirm",
+                      {"verification_id": vid})
+    check("T3 过期确认被拒绝", code == 409 and not data.get("ok")
+          and "过期" in data.get("error", ""), str(data))
+    _, after = call("GET", "/api/state")
+    check("T3 拒绝后订阅表内容不变",
+          [(r["id"], r["source"], r["order_no"]) for r in before["receipts"]]
+          == [(r["id"], r["source"], r["order_no"]) for r in after["receipts"]])
+    check("T3 拒绝后留存表仍为空",
+          archive_ids(before) == set() and archive_ids(after) == set())
+
+    # ---------- T4 核实后更正 -> 哈希不符 ----------
+    code, data = call("POST", "/api/receipts/1001/verify",
+                      {"operator": "自测-甲"})
+    vid = data.get("verification_id")
+    check("T4 重新核实成功", code == 200 and vid is not None)
+    code, data = call("POST", "/api/receipts/1001/correct",
+                      {"order_no": "SO-FIX-1001-B", "customer": "乙公司（二次更正）",
+                       "amount": "251.00", "note": "核实后又被更正"})
+    check("T4 更正成功且旧核实时效", code == 200)
+    _, before = call("GET", "/api/state")
+    code, data = call("POST", "/api/receipts/1001/confirm",
+                      {"verification_id": vid})
+    check("T4 哈希不符确认被拒绝", code == 409 and not data.get("ok")
+          and ("更正" in data.get("error", "") or "不一致" in data.get("error", "")),
+          str(data))
+    _, after = call("GET", "/api/state")
+    check("T4 拒绝后两表保留确认前内容",
+          receipt_rows(after)[1001]["order_no"] == "SO-FIX-1001-B"
+          and archive_ids(after) == set())
+    check("T4 旧核实记录已标记作废",
+          any(v["id"] == vid and v["superseded_at"]
+              for v in after["verifications"]))
+
+    # 伪造核实记录
+    code, data = call("POST", "/api/receipts/1001/confirm",
+                      {"verification_id": 999999})
+    check("T8 伪造核实记录确认被拒", code == 409 and not data.get("ok"), str(data))
+
+    # ---------- T5 正常确认：单事务转存 + 删除 ----------
+    code, data = call("POST", "/api/receipts/1001/verify",
+                      {"operator": "自测-甲"})
+    vid = data.get("verification_id")
+    check("T5 最终核实成功", code == 200 and vid is not None)
+    _, before = call("GET", "/api/state")
+    code, data = call("POST", "/api/receipts/1001/confirm",
+                      {"verification_id": vid})
+    check("T5 确认成功", code == 200 and data.get("ok")
+          and data.get("phase") == "waiting_replay", str(data))
+    state = wait_state(
+        lambda s: s["scenario"]["phase"] == "waiting_replay",
+        "阶段进入 waiting_replay",
+    )
+    check("T5 阶段=等待回放", state["scenario"]["phase"] == "waiting_replay")
+    rows = receipt_rows(state)
+    check("T5 原补录行已从订阅表删除", 1001 not in rows)
+    check("T5 留存表含转存行", archive_ids(state) == {1001})
+    archived = state["archive"][0]
+    check("T5 留存行保留补录内容与来源标记",
+          archived["source"] == "manual"
+          and archived["order_no"] == "SO-FIX-1001-B"
+          and "转存留存" in (archived["note"] or ""))
+    check("T5 核实记录已置 used_at",
+          any(v["id"] == vid and v["used_at"] for v in state["verifications"]))
+    check("T5 确认前留存表为空（确认动作才产生转存）",
+          archive_ids(before) == set())
+    # 阶段已推进，处置入口关闭
+    code, data = call("POST", "/api/receipts/1001/correct",
+                      {"order_no": "X", "customer": "Y",
+                       "amount": "1", "note": "n"})
+    check("T5 等待回放阶段拒绝再更正", code == 409)
+
+    # ---------- T6 回放恢复：两张回执都到达才报恢复 ----------
+    state = wait_state(
+        lambda s: s["scenario"]["phase"] == "recovered",
+        "阶段进入 recovered",
+    )
+    rows = receipt_rows(state)
+    check("T6 阶段=已恢复", state["scenario"]["phase"] == "recovered")
+    check("T6 回执 1000 由订阅回放到达",
+          1000 in rows and rows[1000]["source"] == "upstream")
+    check("T6 回执 1001 由订阅回放到达（上游原始内容）",
+          1001 in rows and rows[1001]["source"] == "upstream"
+          and rows[1001]["order_no"] == "SO-2026-1001",
+          str(rows.get(1001)))
+    check("T6 回放后共两张上游回执",
+          sorted(rows) == [1000, 1001]
+          and all(r["source"] == "upstream" for r in rows.values()))
+    check("T6 留存行仍在留存表", archive_ids(state) == {1001})
+    check("T6 冲突事件均标记已解除",
+          state["conflicts"] and all(c["resolved_at"] for c in state["conflicts"]))
+    check("T6 恢复时间已记录", state["scenario"]["recovered_at"] is not None)
+
+    # ---------- T7 再重置一轮，确认可重复演练 ----------
+    state = fresh_round()
+    check("T7 新一轮冲突形成",
+          state["scenario"]["phase"] == "stuck"
+          and receipt_rows(state)[1001]["source"] == "manual"
+          and archive_ids(state) == set())
+
     print()
     if FAILURES:
-        print(f"共 {len(FAILURES)} 项失败：")
-        for name in FAILURES:
-            print("  -", name)
-        return 1
+        print(f"共 {len(FAILURES)} 项失败：{FAILURES}")
+        sys.exit(1)
     print("全部自测通过。")
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

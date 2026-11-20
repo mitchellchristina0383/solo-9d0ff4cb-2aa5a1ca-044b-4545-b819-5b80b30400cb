@@ -1,297 +1,378 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>并发写入观测台 · 隔离级别沙箱</title>
+<title>逻辑订阅重号冲突 · 恢复演练台</title>
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --ink: #1f2430; --muted: #6b7280;
-    --line: #e3e6ea; --accent: #2563eb;
-    --ok: #15803d; --ok-bg: #dcfce7;
-    --warn: #b45309; --warn-bg: #fef3c7;
-    --bad: #b91c1c; --bad-bg: #fee2e2;
-    --neutral: #4b5563; --neutral-bg: #e5e7eb;
+    --bg: #f4f6fa; --card: #fff; --line: #d9dee8; --text: #1f2733;
+    --muted: #6b7686; --red: #c0392b; --red-bg: #fdecea;
+    --amber: #b9770e; --amber-bg: #fef5e7; --green: #1e8449; --green-bg: #e9f7ef;
+    --blue: #1f618d; --blue-bg: #eaf2f8;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-  header { padding: 18px 24px 6px; }
-  header h1 { font-size: 20px; margin: 0 0 4px; }
-  header p { margin: 0; color: var(--muted); }
-  main { padding: 12px 24px 40px; max-width: 1180px; }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-           padding: 14px 16px; margin-bottom: 16px; }
-  label.block { display: block; font-weight: 600; margin: 12px 0 4px; }
-  textarea { width: 100%; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-             border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
-             background: #fbfbfc; resize: vertical; }
-  #initSql { min-height: 110px; } #script { min-height: 220px; } #checkSql { min-height: 56px; }
-  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
-           padding: 7px 16px; font-size: 14px; cursor: pointer; }
-  button:disabled { opacity: .55; cursor: wait; }
-  button.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
-  select, input[type=number] { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; }
-  input[type=number] { width: 72px; }
-  .hint { color: var(--muted); font-size: 12.5px; }
-  .hint code, code.inline { background: #eef1f5; border-radius: 4px; padding: 1px 5px;
-             font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
-  .round { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-           padding: 14px 16px; margin-bottom: 16px; }
-  .round h2 { font-size: 16px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
-  .badge { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12px;
-           font-weight: 600; white-space: nowrap; }
-  .badge.ok { color: var(--ok); background: var(--ok-bg); }
-  .badge.warn { color: var(--warn); background: var(--warn-bg); }
-  .badge.bad { color: var(--bad); background: var(--bad-bg); }
-  .badge.neutral { color: var(--neutral); background: var(--neutral-bg); }
-  .outcomes { margin: 6px 0 10px; display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left;
-           vertical-align: top; font-size: 12.5px; }
-  th { background: #f1f3f6; font-weight: 600; }
-  td pre { margin: 0; white-space: pre-wrap; word-break: break-all;
-           font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
-  .sess { font-weight: 700; } .sess.A { color: #7c3aed; } .sess.B { color: #0d9488; }
-  .sess.SYS { color: var(--muted); }
-  .err { color: var(--bad); } .muted { color: var(--muted); }
-  .mini { margin-top: 6px; } .mini th, .mini td { padding: 2px 6px; font-size: 12px; }
-  h3.sub { font-size: 14px; margin: 14px 0 6px; }
-  #status { color: var(--muted); }
-  .error-banner { background: var(--bad-bg); color: var(--bad); border: 1px solid var(--bad);
-                  border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { background: #1c2b3a; color: #fff; padding: 16px 24px; }
+  header h1 { margin: 0 0 4px; font-size: 19px; }
+  header p { margin: 0; color: #b9c6d4; font-size: 13px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 60px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 18px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: #f0f3f8; font-weight: 600; }
+  tr.manual td { background: var(--amber-bg); }
+  tr.upstream td { background: var(--green-bg); }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.stuck { background: var(--red-bg); color: var(--red); }
+  .badge.waiting_replay { background: var(--amber-bg); color: var(--amber); }
+  .badge.recovered { background: var(--green-bg); color: var(--green); }
+  .badge.initializing { background: var(--blue-bg); color: var(--blue); }
+  .badge.manual { background: var(--amber-bg); color: var(--amber); }
+  .badge.upstream { background: var(--green-bg); color: var(--green); }
+  .badge.expired { background: var(--red-bg); color: var(--red); }
+  .badge.valid { background: var(--green-bg); color: var(--green); }
+  .badge.used { background: #eef0f3; color: var(--muted); }
+  .badge.superseded { background: var(--red-bg); color: var(--red); }
+  .banner { border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; font-weight: 600; }
+  .banner.stuck { background: var(--red-bg); color: var(--red); border: 1px solid #f5c6cb; }
+  .banner.waiting_replay { background: var(--amber-bg); color: var(--amber); border: 1px solid #f5d99b; }
+  .banner.recovered { background: var(--green-bg); color: var(--green); border: 1px solid #a9dfbf; }
+  .banner.initializing { background: var(--blue-bg); color: var(--blue); border: 1px solid #aed0ea; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .err-box { background: var(--red-bg); border: 1px solid #f5c6cb; color: var(--red);
+    border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-all; }
+  input { width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  button { border: 0; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-warn { background: var(--amber); color: #fff; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-ghost { background: #eef0f3; color: var(--text); }
+  .row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .toast { position: fixed; right: 24px; bottom: 24px; max-width: 420px; z-index: 99; }
+  .toast .item { margin-top: 8px; padding: 10px 14px; border-radius: 8px; color: #fff;
+    box-shadow: 0 4px 14px rgba(0,0,0,.18); font-size: 13px; }
+  .toast .ok { background: var(--green); }
+  .toast .fail { background: var(--red); }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  details summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+  .pill { font-size: 12px; padding: 1px 7px; border-radius: 999px; background: #eef0f3; color: var(--muted); }
+  code { background: #eef0f3; padding: 1px 5px; border-radius: 4px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>并发写入观测台</h1>
-  <p>同一组双会话交错 SQL，从相同初始数据出发，分别在 <b>READ COMMITTED</b> 与
-     <b>SERIALIZABLE</b> 下各跑一轮，对比事务结局与最终数据。改隔离级别之前，先看看数据会变成什么样。</p>
+  <h1>逻辑订阅重号冲突 · 恢复演练台</h1>
+  <p>上游 <code>pubdb.receipts</code> → 逻辑订阅 <code>sub_receipts</code> → 下游 <code>subdb.receipts</code>；
+    人工补录与上游事务重号（23505），整笔事务回放失败。核实 → 转存留存 → 原订阅自动重放。</p>
 </header>
 <main>
-  <section class="panel">
-    <div class="row" style="margin-top:0">
-      <label for="preset"><b>样例：</b></label>
-      <select id="preset"></select>
-      <button type="button" class="secondary" id="loadPreset">载入</button>
-      <span class="hint" id="presetDesc"></span>
+  <div id="banner"></div>
+
+  <div class="card">
+    <h2>① 场景与订阅状态
+      <span class="pill" id="scenario-no"></span>
+      <button class="btn-ghost" style="margin-left:auto" onclick="doReset()">重置到下一轮</button>
+    </h2>
+    <div class="grid2">
+      <div class="kv" id="scenario-kv"></div>
+      <div class="kv" id="sub-kv"></div>
     </div>
+  </div>
 
-    <label class="block" for="initSql">初始数据 SQL（每轮开始前执行，可多条语句；两轮各自重置）</label>
-    <textarea id="initSql" spellcheck="false"></textarea>
+  <div class="card">
+    <h2>② 订阅写入失败 / 重号事件
+      <span class="muted" style="font-weight:400">（后台监控解析 csvlog；日志不可用时启发式兜底）</span>
+    </h2>
+    <div id="conflicts"><p class="muted">尚未探测到冲突事件…</p></div>
+  </div>
 
-    <label class="block" for="script">交错脚本</label>
-    <textarea id="script" spellcheck="false"></textarea>
-    <div class="hint">
-      每步一个头部：<code>@A complete</code>（等语句完成，默认）或
-      <code>@B blocked</code>（等数据库确认被另一会话阻塞即推进，语句留在后台，持锁会话可继续 COMMIT）。
-      头部之下到下一个头部之间是该步的 SQL。事务由引擎按本轮隔离级别自动 BEGIN，脚本里用
-      <code>COMMIT</code> / <code>ROLLBACK</code> 收尾；脚本结束仍未提交的事务会被回滚。
+  <div class="grid2">
+    <div class="card">
+      <h2>③ 下游 receipts（订阅表）</h2>
+      <div id="receipts"></div>
     </div>
-
-    <label class="block" for="checkSql">核对查询（两轮事务都结束后，在新连接上执行）</label>
-    <textarea id="checkSql" spellcheck="false"></textarea>
-
-    <div class="row">
-      <label for="timeout">每轮超时（秒）：</label>
-      <input id="timeout" type="number" min="1" max="60" step="1" value="5">
-      <button type="button" id="run">运行（两种隔离级别各一轮）</button>
-      <span id="status"></span>
+    <div class="card">
+      <h2>④ receipts_archive（留存表）</h2>
+      <div id="archive"></div>
     </div>
-  </section>
+  </div>
 
-  <section id="results"></section>
+  <div class="card" id="ops-card">
+    <h2>⑤ 人工补录处置（更正 / 核实 / 确认转存）</h2>
+    <div id="ops"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑥ 核实记录 <span class="muted" style="font-weight:400">（有效期 {{ ttl }} 秒；过期或核实后被更正，确认将被拒绝）</span></h2>
+    <div id="verifications"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑦ 操作审计</h2>
+    <div id="actions"></div>
+  </div>
+
+  <div class="card">
+    <h2>⑧ 演练步骤说明</h2>
+    <ol class="muted" style="margin:0; padding-left:20px">
+      <li>下游先人工补录回执 <code>1001</code>；上游一笔事务新增 <code>1000、1001</code> 两张回执。</li>
+      <li>apply worker 回放整笔事务时在 <code>1001</code> 撞主键重号，事务回滚并反复重试 —— 订阅卡住，两张回执都进不了下游。</li>
+      <li>值班员核实补录内容（生成带哈希与有效期的核实记录）；也可以先更正补录行（更正后旧核实作废，须重新核实）。</li>
+      <li>确认后，补录行在<b>同一事务</b>内转存留存表并删除原行；任一失败整体回滚，两表内容不变。</li>
+      <li>冲突清除，原订阅自动重放整笔上游事务；页面先显示「等待回放」，两张上游回执都到达后才报「已恢复」。</li>
+    </ol>
+  </div>
 </main>
+<div class="toast" id="toast"></div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-let presets = [];
+const TTL = {{ ttl }};
+let STATE = null;
 
-const KIND_LABELS = {
-  reset: "重置初始数据",
-  begin: "开始事务",
-  step_start: "执行",
-  step_ok: "完成",
-  step_error: "出错",
-  blocked: "确认被阻塞，推进",
-  no_block: "未阻塞（直接完成）",
-  rollback: "引擎回滚",
-  rollback_error: "回滚失败",
-  timeout: "超时，结束本轮",
-  check: "核对查询",
-  round_error: "本轮出错",
-};
-const OUTCOME_LABELS = {
-  committed: ["已提交", "ok"],
-  rolled_back: ["已回滚", "neutral"],
-  aborted: ["已中止", "bad"],
-  unknown: ["未知", "neutral"],
-};
-
-function el(tag, cls, text) {
-  const node = document.createElement(tag);
-  if (cls) node.className = cls;
-  if (text !== undefined && text !== null) node.textContent = text;
-  return node;
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-
-function sqlBlock(sql) {
-  const pre = el("pre");
-  pre.textContent = sql;
-  return pre;
+function toast(msg, ok) {
+  const el = document.createElement('div');
+  el.className = 'item ' + (ok ? 'ok' : 'fail');
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(() => el.remove(), 6000);
 }
-
-function rowsTable(columns, rows) {
-  const table = el("table", "mini");
-  const trh = el("tr");
-  columns.forEach((c) => trh.appendChild(el("th", null, c)));
-  table.appendChild(trh);
-  rows.forEach((r) => {
-    const tr = el("tr");
-    r.forEach((v) => tr.appendChild(el("td", null, v === null ? "NULL" : String(v))));
-    table.appendChild(tr);
+async function api(path, method='GET', body) {
+  const r = await fetch(path, {
+    method,
+    headers: {'Content-Type': 'application/json'},
+    body: body ? JSON.stringify(body) : undefined,
   });
-  return table;
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+const phaseBadge = p =>
+  `<span class="badge ${p}">${esc(STATE?.phase_label || p)}</span>`;
+
+function renderBanner() {
+  const p = STATE.scenario.phase;
+  const map = {
+    stuck: '⛔ 订阅卡住：上游事务回放遇到重号，整笔事务反复回滚重试。请处置人工补录行后确认。',
+    waiting_replay: '⏳ 等待回放：补录行已转存留存，原订阅正在重放整笔上游事务，需两张回执全部到达才判定恢复。',
+    recovered: '✅ 已恢复：两张上游回执均由订阅回放到达，冲突解除。',
+    initializing: '… 正在初始化演示场景。',
+  };
+  document.getElementById('banner').innerHTML =
+    `<div class="banner ${p}">${map[p] || esc(p)}</div>`;
 }
 
-function renderEvent(ev) {
-  const tr = el("tr");
-  tr.appendChild(el("td", null, ev.t.toFixed(3) + "s"));
-  tr.appendChild(el("td", "sess " + ev.session, ev.session));
-  let label = KIND_LABELS[ev.kind] || ev.kind;
-  if (ev.kind === "step_ok" && ev.after_blocked) label = "解除阻塞后完成";
-  if (ev.kind === "step_error" && ev.after_blocked) label = "解除阻塞后出错";
-  tr.appendChild(el("td", null, label));
-
-  const td = el("td");
-  if (ev.sql) td.appendChild(sqlBlock(ev.sql));
-  if (ev.kind === "step_start" && ev.mode) {
-    td.appendChild(el("div", "muted", "模式：" + ev.mode));
-  }
-  if (ev.status) td.appendChild(el("div", "muted", "→ " + ev.status));
-  if (ev.error) td.appendChild(el("div", "err", (ev.pgcode ? ev.pgcode + " " : "") + ev.error));
-  if (ev.kind === "blocked") {
-    td.appendChild(el("div", null,
-      "阻塞者 pid：" + (ev.blockers || []).join(", ") +
-      (ev.by_other ? "（正是另一会话）" : "（不是另一会话！）")));
-  }
-  if (ev.detail) td.appendChild(el("div", "muted", ev.detail));
-  if (ev.columns && ev.rows) td.appendChild(rowsTable(ev.columns, ev.rows));
-  tr.appendChild(td);
-  return tr;
+function renderScenario() {
+  const s = STATE.scenario;
+  document.getElementById('scenario-no').textContent = '第 ' + s.scenario_no + ' 轮';
+  document.getElementById('scenario-kv').innerHTML = `
+    <div class="k">当前阶段</div><div>${phaseBadge(s.phase)}</div>
+    <div class="k">卡住事务回执</div><div class="mono">${esc((s.expected_ids||[]).join(', '))}</div>
+    <div class="k">冲突回执 ID</div><div class="mono">${esc(s.conflict_id ?? '—')}</div>
+    <div class="k">恢复时间</div><div class="mono">${esc(s.recovered_at ?? '—')}</div>`;
+  const sub = STATE.subscription || {};
+  const rel = (STATE.subscription_rel || []).map(r =>
+    `<span class="pill mono">relid=${r.srrelid} 状态=${esc(r.srsubstate)} lsn=${esc(r.srsublsn ?? '—')}</span>`).join(' ');
+  document.getElementById('sub-kv').innerHTML = `
+    <div class="k">订阅名</div><div class="mono">${esc(sub.subname ?? '—')}</div>
+    <div class="k">是否启用</div><div>${sub.subenabled ? '启用中' : '已停用'}</div>
+    <div class="k">槽位点 flush_lsn</div><div class="mono">${esc(sub.confirmed_flush_lsn ?? '—')}</div>
+    <div class="k">表同步状态</div><div>${rel || '—'}</div>`;
 }
 
-function renderRound(round) {
-  const box = el("div", "round");
-  const h2 = el("h2");
-  h2.appendChild(el("span", null, round.isolation));
-  if (round.error) {
-    h2.appendChild(el("span", "badge bad", "本轮出错"));
-  } else if (round.timed_out) {
-    h2.appendChild(el("span", "badge warn", "超时结束"));
-  } else {
-    h2.appendChild(el("span", "badge ok", "正常完成"));
+function renderConflicts() {
+  const list = STATE.conflicts || [];
+  if (!list.length) {
+    document.getElementById('conflicts').innerHTML =
+      '<p class="muted">尚未探测到冲突事件…（监控每秒扫描一次 csvlog）</p>';
+    return;
   }
-  h2.appendChild(el("span", "muted", "耗时 " + round.duration + "s"));
-  box.appendChild(h2);
-
-  if (round.error) {
-    box.appendChild(el("div", "error-banner", round.error));
-  }
-
-  const names = Object.keys(round.outcomes || {}).sort();
-  if (names.length) {
-    const oc = el("div", "outcomes");
-    oc.appendChild(el("b", null, "事务结局："));
-    names.forEach((n) => {
-      const o = round.outcomes[n];
-      const [text, cls] = OUTCOME_LABELS[o.outcome] || OUTCOME_LABELS.unknown;
-      const span = el("span");
-      span.appendChild(el("span", "sess " + n, n + " "));
-      span.appendChild(el("span", "badge " + cls, text));
-      if (o.note) span.appendChild(el("span", "muted", " " + o.note));
-      oc.appendChild(span);
-    });
-    box.appendChild(oc);
-  }
-
-  box.appendChild(el("h3", "sub", "执行时间线"));
-  const tl = el("table");
-  const head = el("tr");
-  ["时间", "会话", "事件", "SQL / 详情"].forEach((t) => head.appendChild(el("th", null, t)));
-  tl.appendChild(head);
-  round.events.forEach((ev) => tl.appendChild(renderEvent(ev)));
-  box.appendChild(tl);
-
-  if (round.check) {
-    box.appendChild(el("h3", "sub", "核对查询结果"));
-    if (round.check.error) {
-      box.appendChild(el("div", "error-banner",
-        (round.check.pgcode ? round.check.pgcode + " " : "") + round.check.error));
-    } else if (round.check.columns) {
-      box.appendChild(rowsTable(round.check.columns, round.check.rows));
-    } else {
-      box.appendChild(el("div", "muted", "→ " + (round.check.status || "（无结果集）")));
-    }
-  }
-  return box;
+  document.getElementById('conflicts').innerHTML = '<table><thead><tr>' +
+    '<th>#</th><th>探测时间</th><th>SQLSTATE</th><th>关联回执</th><th>来源</th><th>状态</th><th>报错内容</th>' +
+    '</tr></thead><tbody>' +
+    list.map(c => `<tr>
+      <td>${c.id}</td>
+      <td class="mono">${esc(c.detected_at)}</td>
+      <td class="mono">${esc(c.sqlstate ?? '—')}</td>
+      <td class="mono">${esc(c.receipt_id ?? '—')}</td>
+      <td><span class="pill">${c.source === 'log' ? 'csvlog 真实报错' : '启发式兜底'}</span></td>
+      <td>${c.resolved_at ? '<span class="badge valid">已解除</span>' : '<span class="badge stuck">未解除</span>'}</td>
+      <td><div class="err-box" style="background:#fff">${esc(c.message)}</div></td>
+    </tr>`).join('') + '</tbody></table>';
 }
 
-async function loadPresets() {
-  const resp = await fetch("/api/presets");
-  presets = await resp.json();
-  const sel = $("preset");
-  presets.forEach((p, i) => {
-    const opt = el("option", null, p.name);
-    opt.value = i;
-    sel.appendChild(opt);
-  });
-  if (presets.length) fillPreset(0);
+function receiptTable(rows, empty) {
+  if (!rows.length) return `<p class="muted">${empty}</p>`;
+  return '<table><thead><tr>' +
+    '<th>id</th><th>来源</th><th>单号</th><th>客户</th><th>金额</th><th>发货时间</th><th>备注</th>' +
+    '</tr></thead><tbody>' +
+    rows.map(r => `<tr class="${esc(r.source)}">
+      <td class="mono">${r.id}</td>
+      <td><span class="badge ${r.source}">${r.source === 'manual' ? '人工补录' : '上游订阅'}</span></td>
+      <td>${esc(r.order_no)}</td><td>${esc(r.customer)}</td>
+      <td class="mono">${esc(r.amount)}</td>
+      <td class="mono">${esc(r.shipped_at)}</td><td>${esc(r.note ?? '')}</td>
+    </tr>`).join('') + '</tbody></table>';
 }
 
-function fillPreset(i) {
-  const p = presets[i];
-  if (!p) return;
-  $("initSql").value = p.init_sql;
-  $("script").value = p.script;
-  $("checkSql").value = p.check_sql;
-  $("presetDesc").textContent = p.description;
+function renderReceipts() {
+  document.getElementById('receipts').innerHTML =
+    receiptTable(STATE.receipts || [], '下游暂无回执');
+  document.getElementById('archive').innerHTML =
+    receiptTable(STATE.archive || [], '留存表为空（确认转存后出现在这里）');
 }
 
-async function run() {
-  $("run").disabled = true;
-  $("status").textContent = "运行中……";
-  $("results").textContent = "";
+function renderOps() {
+  const mutable = STATE.scenario.phase === 'stuck';
+  const manual = (STATE.receipts || []).filter(r => r.source === 'manual');
+  if (!mutable) {
+    document.getElementById('ops').innerHTML =
+      `<p class="muted">当前阶段为「${esc(STATE.phase_label)}」，更正/核实/确认入口已关闭。</p>`;
+    return;
+  }
+  if (!manual.length) {
+    document.getElementById('ops').innerHTML =
+      '<p class="muted">订阅表中没有人工补录行（可能已转存）。</p>';
+    return;
+  }
+  const r = manual[0];
+  const latestV = (STATE.verifications || []).find(v => v.receipt_id === r.id);
+  document.getElementById('ops').innerHTML = `
+    <div class="grid2">
+      <form id="correct-form">
+        <strong>更正补录行（id=${r.id}）</strong>
+        <label>单号</label><input name="order_no" value="${esc(r.order_no)}">
+        <label>客户</label><input name="customer" value="${esc(r.customer)}">
+        <label>金额</label><input name="amount" value="${esc(r.amount)}">
+        <label>备注</label><input name="note" value="${esc(r.note ?? '')}">
+        <div class="row-actions">
+          <button type="button" class="btn-warn" onclick="doCorrect(${r.id})">提交更正（旧核实作废）</button>
+        </div>
+      </form>
+      <div>
+        <strong>核实与确认</strong>
+        <p class="muted" style="margin:8px 0">核实会对当前内容计算哈希并记录 ${TTL} 秒有效期；
+          确认时重新计算哈希，核实后若被更正则拒绝。转存与删除在同一事务提交。</p>
+        <label>值班员工号/姓名</label><input id="operator" value="值班员-张">
+        <div class="row-actions">
+          <button class="btn-primary" onclick="doVerify(${r.id})">核实当前内容</button>
+          <button class="btn-danger" onclick="doConfirm(${r.id})"
+            ${latestV && !latestV.superseded_at && !latestV.used_at ? '' : 'disabled'}
+            title="${latestV ? '' : '请先核实'}">确认转存并删除原行</button>
+        </div>
+        <p class="muted" id="confirm-hint"></p>
+      </div>
+    </div>`;
+  if (latestV) {
+    const expired = new Date(latestV.expires_at) <= new Date();
+    const state = latestV.used_at ? ['used', '已使用']
+      : latestV.superseded_at ? ['superseded', '已作废（更正）']
+      : expired ? ['expired', '已过期'] : ['valid', '有效'];
+    document.getElementById('confirm-hint').innerHTML =
+      `最近核实记录 #${latestV.id}：<span class="badge ${state[0]}">${state[1]}</span>
+       <span class="mono">过期时间 ${esc(latestV.expires_at)}</span>`;
+  }
+}
+
+function renderVerifications() {
+  const list = STATE.verifications || [];
+  if (!list.length) {
+    document.getElementById('verifications').innerHTML =
+      '<p class="muted">暂无核实记录。</p>';
+    return;
+  }
+  const now = Date.now();
+  document.getElementById('verifications').innerHTML = '<table><thead><tr>' +
+    '<th>#</th><th>回执</th><th>操作人</th><th>核实时间</th><th>过期时间</th><th>状态</th><th>内容哈希(前12位)</th>' +
+    '</tr></thead><tbody>' +
+    list.map(v => {
+      const expired = new Date(v.expires_at).getTime() <= now;
+      const state = v.used_at ? ['used', '已使用']
+        : v.superseded_at ? ['superseded', '已作废']
+        : expired ? ['expired', '已过期'] : ['valid', '有效'];
+      return `<tr>
+        <td>${v.id}</td><td class="mono">${v.receipt_id}</td><td>${esc(v.operator)}</td>
+        <td class="mono">${esc(v.verified_at)}</td><td class="mono">${esc(v.expires_at)}</td>
+        <td><span class="badge ${state[0]}">${state[1]}</span></td>
+        <td class="mono">${esc(v.content_hash.slice(0, 12))}…</td></tr>`;
+    }).join('') + '</tbody></table>';
+}
+
+function renderActions() {
+  const list = STATE.actions || [];
+  if (!list.length) {
+    document.getElementById('actions').innerHTML = '<p class="muted">暂无操作。</p>';
+    return;
+  }
+  document.getElementById('actions').innerHTML =
+    '<table><thead><tr><th>时间</th><th>动作</th><th>详情</th></tr></thead><tbody>' +
+    list.map(a => `<tr><td class="mono">${esc(a.ts)}</td><td><span class="pill">${esc(a.action)}</span></td>
+      <td>${esc(a.detail)}</td></tr>`).join('') + '</tbody></table>';
+}
+
+function formValues(id) {
+  const fd = new FormData(document.getElementById(id));
+  return Object.fromEntries(fd.entries());
+}
+
+async function doCorrect(id) {
   try {
-    const resp = await fetch("/api/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        init_sql: $("initSql").value,
-        script: $("script").value,
-        check_sql: $("checkSql").value,
-        timeout_s: parseFloat($("timeout").value) || 5,
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      $("results").appendChild(el("div", "error-banner", data.error || ("HTTP " + resp.status)));
-      return;
-    }
-    data.rounds.forEach((r) => $("results").appendChild(renderRound(r)));
-  } catch (e) {
-    $("results").appendChild(el("div", "error-banner", String(e)));
-  } finally {
-    $("run").disabled = false;
-    $("status").textContent = "";
-  }
+    await api(`/api/receipts/${id}/correct`, 'POST', formValues('correct-form'));
+    toast('已更正，旧核实记录作废，需要重新核实', true);
+  } catch (e) { toast(e.message, false); }
+  await refresh();
+}
+async function doVerify(id) {
+  const operator = document.getElementById('operator').value;
+  try {
+    await api(`/api/receipts/${id}/verify`, 'POST', {operator});
+    toast('核实完成，已生成带有效期的核实记录', true);
+  } catch (e) { toast(e.message, false); }
+  await refresh();
+}
+async function doConfirm(id) {
+  const latestV = (STATE.verifications || []).find(v => v.receipt_id === id);
+  if (!latestV) { toast('请先核实再确认', false); return; }
+  try {
+    await api(`/api/receipts/${id}/confirm`, 'POST', {verification_id: latestV.id});
+    toast('确认成功：已转存留存并删除原行，进入等待回放', true);
+  } catch (e) { toast('确认被拒绝：' + e.message, false); }
+  await refresh();
+}
+async function doReset() {
+  if (!confirm('重置演示环境？将清空两张库的演示数据并重新注入冲突。')) return;
+  try {
+    const d = await api('/api/reset', 'POST');
+    toast('已重置到第 ' + d.scenario_no + ' 轮', true);
+  } catch (e) { toast(e.message, false); }
+  await refresh();
 }
 
-$("loadPreset").addEventListener("click", () => fillPreset(Number($("preset").value)));
-$("preset").addEventListener("change", () => fillPreset(Number($("preset").value)));
-$("run").addEventListener("click", run);
-loadPresets().catch((e) => { $("status").textContent = "样例加载失败：" + e; });
+async function refresh() {
+  try {
+    STATE = await api('/api/state');
+    renderBanner(); renderScenario(); renderConflicts();
+    renderReceipts(); renderOps(); renderVerifications(); renderActions();
+  } catch (e) {
+    document.getElementById('banner').innerHTML =
+      `<div class="banner stuck">状态加载失败：${esc(e.message)}</div>`;
+  }
+}
+refresh();
+setInterval(refresh, 1500);
 </script>
 </body>
 </html>

@@ -1,16 +1,43 @@
 services:
   db:
-    image: postgres:16
+    build:
+      context: ./db
+      dockerfile: Dockerfile
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: sandbox
-      POSTGRES_DB: sandbox
+      POSTGRES_DB: postgres
+    command:
+      # 逻辑复制前置配置 + csvlog 输出到共享目录，供 web 容器解析订阅报错
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "logging_collector=on"
+      - "-c"
+      - "log_destination=csvlog"
+      - "-c"
+      - "log_directory=/var/log/postgresql"
+      - "-c"
+      - "log_filename=postgresql-%Y-%m-%d.log"
+      - "-c"
+      - "log_rotation_age=1d"
+      - "-c"
+      - "log_rotation_size=100MB"
+      - "-c"
+      - "log_min_messages=warning"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pglog:/var/log/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d sandbox"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d subdb && pg_isready -U postgres -d pubdb"]
       interval: 1s
       timeout: 3s
       retries: 30
-    # 纯沙箱：数据每轮都会被“初始数据 SQL”重置，不挂卷，删掉容器即清空
 
   web:
     build:
@@ -19,12 +46,24 @@ services:
     environment:
       PGHOST: db
       PGPORT: "5432"
-      PGDATABASE: sandbox
       PGUSER: postgres
       PGPASSWORD: sandbox
+      PUB_DBNAME: pubdb
+      SUB_DBNAME: subdb
+      SUBSCRIPTION_NAME: sub_receipts
+      # 共享 db 容器的 csvlog 目录（同名命名卷）
+      PG_LOG_DIR: /var/log/postgresql
+      # 核实记录有效期（秒）
+      VERIFY_TTL_SECONDS: "60"
       PORT: "8080"
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      - pglog:/var/log/postgresql:ro
     depends_on:
       db:
         condition: service_healthy
+
+volumes:
+  pgdata:
+  pglog:
